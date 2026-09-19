@@ -4,6 +4,9 @@ import cors from '@fastify/cors';
 import rawBody from 'fastify-raw-body';
 import { checkDbConnection, query } from './db/connection.js';
 import { generateProjectApiKey, verifyApiKey } from './auth/keys.js';
+import { encryptSecret, decryptSecret } from './auth/encryption.js';
+import { redactSecrets } from './auth/redaction.js';
+import { PaystackProvider } from './providers/paystack.js';
 import { PaymentEngine } from './payments/engine.js';
 import { WebhookIngestionService } from './webhooks/ingestion.js';
 
@@ -177,6 +180,26 @@ export function buildApp(): FastifyInstance {
     if (!auth) return;
 
     const code = String(req.params.code).toUpperCase();
+
+    if (code === 'NG') {
+      const connRes = await query(
+        `SELECT id FROM provider_connections WHERE project_id = $1 AND provider = 'paystack' AND status = 'connected'`,
+        [auth.projectId]
+      );
+      if (connRes.rows.length === 0) {
+        reply.status(400).send({
+          error: {
+            message: "Cannot enable market 'NG' without an active Paystack provider connection.",
+            reason: 'ZIMBI requires a verified merchant-owned Paystack connection before activating Nigeria payments.',
+            fix: 'Connect Paystack first: zimbi provider connect paystack',
+            code: 5,
+            requestId: req.requestId,
+          },
+        });
+        return;
+      }
+    }
+
     const res = await query(
       `UPDATE markets
        SET status = 'active', updated_at = NOW()
@@ -276,26 +299,316 @@ export function buildApp(): FastifyInstance {
     };
   });
 
-  // --- Providers ---
-  app.get('/v1/providers', async (req: any, reply) => {
+  // --- Provider Connections (Merchant-Owned) ---
+  app.get('/v1/provider-connections', async (req: any, reply) => {
     const auth = await authenticate(req, reply);
     if (!auth) return;
 
     const res = await query(
+      `SELECT id, project_id, provider, environment, display_name, status,
+              external_account_id, capabilities, last_validated_at, last_request_at,
+              created_at, updated_at
+       FROM provider_connections
+       WHERE project_id = $1
+       ORDER BY created_at DESC`,
+      [auth.projectId]
+    );
+
+    return {
+      connections: res.rows.map((r) => ({
+        id: r.id,
+        projectId: r.project_id,
+        provider: r.provider,
+        environment: r.environment,
+        displayName: r.display_name,
+        status: r.status,
+        externalAccountId: r.external_account_id,
+        capabilities: r.capabilities,
+        lastValidatedAt: r.last_validated_at,
+        lastRequestAt: r.last_request_at,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      })),
+    };
+  });
+
+  app.post('/v1/provider-connections', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const body = req.body || {};
+    const targetProvider = String(body.provider || 'paystack').toLowerCase();
+    const rawSecretKey = typeof body.secretKey === 'string' ? body.secretKey.trim() : '';
+    const targetEnv = body.environment || auth.environment || 'test';
+
+    if (!rawSecretKey) {
+      reply.status(400).send({
+        error: {
+          message: 'Secret key is required to connect a provider.',
+          reason: 'Missing secretKey parameter in request body.',
+          fix: 'Provide secretKey when connecting a provider.',
+          code: 5,
+          requestId: req.requestId,
+        },
+      });
+      return;
+    }
+
+    if (targetProvider !== 'paystack') {
+      reply.status(400).send({
+        error: {
+          message: `Provider '${targetProvider}' is not supported yet.`,
+          reason: 'Supported providers: paystack.',
+          code: 5,
+          requestId: req.requestId,
+        },
+      });
+      return;
+    }
+
+    // Step 1: Real Credential Validation via Paystack GET /balance
+    const providerAdapter = new PaystackProvider({
+      environment: targetEnv,
+      secretKey: rawSecretKey,
+    });
+
+    const validation = await providerAdapter.validateCredentials();
+    if (!validation.valid) {
+      reply.status(400).send({
+        error: {
+          message: redactSecrets(validation.message || 'Paystack credentials could not be verified.'),
+          reason: 'Validation call to Paystack rejected the provided secret key.',
+          fix: 'Verify the key in your Paystack dashboard and ensure it starts with sk_test_ for test mode or sk_live_ for live mode.',
+          code: 5,
+          requestId: req.requestId,
+        },
+      });
+      return;
+    }
+
+    // Step 2: Encrypt secret key at rest (AES-256-GCM)
+    const encrypted = encryptSecret(rawSecretKey);
+    const connId = `conn_${crypto.randomBytes(6).toString('hex')}`;
+    const displayName =
+      body.displayName || `${targetProvider.charAt(0).toUpperCase() + targetProvider.slice(1)} (${targetEnv})`;
+    const capabilities = providerAdapter.getCapabilities('NG');
+
+    // Step 3: Transactional atomic upsert into provider_connections
+    const insertRes = await query(
+      `INSERT INTO provider_connections (
+         id, project_id, provider, environment, display_name, status,
+         credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version,
+         external_account_id, capabilities, last_validated_at, last_request_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, 'connected', $6, $7, $8, 1, NULL, $9, NOW(), NOW(), NOW(), NOW())
+       ON CONFLICT (project_id, provider, environment) DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         status = 'connected',
+         credential_ciphertext = EXCLUDED.credential_ciphertext,
+         credential_iv = EXCLUDED.credential_iv,
+         credential_auth_tag = EXCLUDED.credential_auth_tag,
+         credential_key_version = provider_connections.credential_key_version + 1,
+         capabilities = EXCLUDED.capabilities,
+         last_validated_at = NOW(),
+         last_request_at = NOW(),
+         updated_at = NOW(),
+         revoked_at = NULL
+       RETURNING id, project_id, provider, environment, display_name, status, external_account_id, capabilities, last_validated_at, last_request_at, created_at, updated_at`,
+      [
+        connId,
+        auth.projectId,
+        targetProvider,
+        targetEnv,
+        displayName,
+        encrypted.ciphertext,
+        encrypted.iv,
+        encrypted.authTag,
+        JSON.stringify(capabilities),
+      ]
+    );
+
+    // Keep legacy table synchronized
+    await query(
+      `UPDATE providers SET status = 'connected', updated_at = NOW() WHERE project_id = $1 AND provider_id = $2`,
+      [auth.projectId, targetProvider]
+    );
+
+    const r = insertRes.rows[0];
+    reply.status(201).send({
+      id: r.id,
+      projectId: r.project_id,
+      provider: r.provider,
+      environment: r.environment,
+      displayName: r.display_name,
+      status: r.status,
+      externalAccountId: r.external_account_id,
+      capabilities: r.capabilities,
+      lastValidatedAt: r.last_validated_at,
+      lastRequestAt: r.last_request_at,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    });
+  });
+
+  app.get('/v1/provider-connections/:id', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const target = String(req.params.id);
+    const res = await query(
+      `SELECT id, project_id, provider, environment, display_name, status,
+              external_account_id, capabilities, last_validated_at, last_request_at,
+              created_at, updated_at
+       FROM provider_connections
+       WHERE project_id = $1 AND (id = $2 OR provider = $2)
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [auth.projectId, target]
+    );
+
+    if (res.rows.length === 0) {
+      reply.status(404).send({
+        error: { message: `Provider connection '${target}' not found.`, code: 5, requestId: req.requestId },
+      });
+      return;
+    }
+
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      projectId: r.project_id,
+      provider: r.provider,
+      environment: r.environment,
+      displayName: r.display_name,
+      status: r.status,
+      externalAccountId: r.external_account_id,
+      capabilities: r.capabilities,
+      lastValidatedAt: r.last_validated_at,
+      lastRequestAt: r.last_request_at,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  });
+
+  app.post('/v1/provider-connections/:id/validate', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const target = String(req.params.id);
+    const res = await query(
+      `SELECT * FROM provider_connections
+       WHERE project_id = $1 AND (id = $2 OR provider = $2) AND status = 'connected'`,
+      [auth.projectId, target]
+    );
+
+    if (res.rows.length === 0) {
+      reply.status(404).send({
+        error: {
+          message: `Active provider connection '${target}' not found.`,
+          code: 5,
+          requestId: req.requestId,
+        },
+      });
+      return;
+    }
+
+    const conn = res.rows[0];
+    const secretKey = decryptSecret({
+      ciphertext: conn.credential_ciphertext,
+      iv: conn.credential_iv,
+      authTag: conn.credential_auth_tag,
+      keyVersion: conn.credential_key_version,
+    });
+
+    const provAdapter = new PaystackProvider({
+      environment: conn.environment as any,
+      secretKey,
+    });
+
+    const valResult = await provAdapter.validateCredentials();
+    await query(
+      `UPDATE provider_connections
+       SET last_validated_at = NOW(),
+           last_error_code = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [valResult.valid ? null : 'INVALID_CREDENTIALS', conn.id]
+    );
+
+    return {
+      id: conn.id,
+      valid: valResult.valid,
+      message: redactSecrets(valResult.message || ''),
+      environment: conn.environment,
+    };
+  });
+
+  app.post('/v1/provider-connections/:id/disconnect', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const target = String(req.params.id);
+    const res = await query(
+      `UPDATE provider_connections
+       SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
+       WHERE project_id = $1 AND (id = $2 OR provider = $2)
+       RETURNING *`,
+      [auth.projectId, target]
+    );
+
+    if (res.rows.length === 0) {
+      reply.status(404).send({
+        error: { message: `Provider connection '${target}' not found.`, code: 5, requestId: req.requestId },
+      });
+      return;
+    }
+
+    const r = res.rows[0];
+    await query(
+      `UPDATE providers SET status = 'available', updated_at = NOW()
+       WHERE project_id = $1 AND provider_id = $2`,
+      [auth.projectId, r.provider]
+    );
+
+    return {
+      id: r.id,
+      provider: r.provider,
+      status: 'revoked',
+      disconnected: true,
+    };
+  });
+
+  // --- Legacy Providers Endpoints (Maintained & Wired to Provider Connections) ---
+  app.get('/v1/providers', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const provRes = await query(
       `SELECT provider_id, status, environment, capabilities, last_request_at
        FROM providers WHERE project_id = $1`,
       [auth.projectId]
     );
 
+    const connRes = await query(
+      `SELECT provider, status, environment, last_request_at, capabilities
+       FROM provider_connections WHERE project_id = $1`,
+      [auth.projectId]
+    );
+
+    const activeMap = new Map(connRes.rows.map((c) => [c.provider, c]));
+
     return {
-      providers: res.rows.map((r) => ({
-        id: r.provider_id,
-        name: r.provider_id.charAt(0).toUpperCase() + r.provider_id.slice(1),
-        status: r.status,
-        environment: r.environment,
-        capabilities: r.capabilities,
-        lastSuccessfulRequest: r.last_request_at,
-      })),
+      providers: provRes.rows.map((r) => {
+        const conn = activeMap.get(r.provider_id);
+        const isConnected = conn ? conn.status === 'connected' : r.status === 'connected';
+        return {
+          id: r.provider_id,
+          name: r.provider_id.charAt(0).toUpperCase() + r.provider_id.slice(1),
+          status: isConnected ? 'connected' : 'available',
+          environment: conn?.environment || r.environment,
+          capabilities: conn?.capabilities?.paymentMethods || r.capabilities,
+          lastSuccessfulRequest: conn?.last_request_at || r.last_request_at,
+        };
+      }),
     };
   });
 
@@ -305,29 +618,78 @@ export function buildApp(): FastifyInstance {
 
     const providerId = String(req.params.id).toLowerCase();
     const body = req.body || {};
+    const secretKey = typeof body.secretKey === 'string' ? body.secretKey.trim() : '';
 
-    const res = await query(
-      `UPDATE providers
-       SET status = 'connected', last_request_at = NOW(), updated_at = NOW()
-       WHERE project_id = $1 AND provider_id = $2
-       RETURNING *`,
-      [auth.projectId, providerId]
-    );
-
-    if (res.rows.length === 0) {
-      reply.status(404).send({
-        error: { message: `Provider '${providerId}' not found.`, code: 5, requestId: req.requestId },
+    if (secretKey) {
+      // Delegate to secure provider connections flow
+      const connRes = await (app as any).inject({
+        method: 'POST',
+        url: '/v1/provider-connections',
+        headers: { authorization: req.headers.authorization },
+        payload: { provider: providerId, secretKey, environment: body.environment || auth.environment },
+      });
+      const data = JSON.parse(connRes.payload);
+      if (connRes.statusCode >= 400) {
+        reply.status(connRes.statusCode).send(data);
+        return;
+      }
+      reply.status(200).send({
+        provider: data.provider,
+        name: data.provider.charAt(0).toUpperCase() + data.provider.slice(1),
+        status: data.status,
+        environment: data.environment,
       });
       return;
     }
 
-    const r = res.rows[0];
-    return {
-      provider: r.provider_id,
-      name: r.provider_id.charAt(0).toUpperCase() + r.provider_id.slice(1),
-      status: r.status,
-      environment: r.environment,
-    };
+    // Fallback: check if active connection already exists
+    const existing = await query(
+      `SELECT * FROM provider_connections WHERE project_id = $1 AND provider = $2 AND status = 'connected'`,
+      [auth.projectId, providerId]
+    );
+
+    if (existing.rows.length === 0) {
+      reply.status(400).send({
+        error: {
+          message: 'Secret key is required to connect provider.',
+          reason: 'No secret key was provided and no existing connection exists.',
+          fix: `Run: zimbi provider connect ${providerId}`,
+          code: 5,
+          requestId: req.requestId,
+        },
+      });
+      return;
+    }
+
+    reply.status(200).send({
+      provider: providerId,
+      name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
+      status: 'connected',
+      environment: auth.environment,
+    });
+  });
+
+  app.post('/v1/providers/:id/disconnect', async (req: any, reply) => {
+    const auth = await authenticate(req, reply);
+    if (!auth) return;
+
+    const providerId = String(req.params.id).toLowerCase();
+    await query(
+      `UPDATE provider_connections SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
+       WHERE project_id = $1 AND provider = $2`,
+      [auth.projectId, providerId]
+    );
+
+    await query(
+      `UPDATE providers SET status = 'available', updated_at = NOW()
+       WHERE project_id = $1 AND provider_id = $2`,
+      [auth.projectId, providerId]
+    );
+
+    reply.status(200).send({
+      provider: providerId,
+      disconnected: true,
+    });
   });
 
   app.get('/v1/providers/:id/status', async (req: any, reply) => {
@@ -335,27 +697,22 @@ export function buildApp(): FastifyInstance {
     if (!auth) return;
 
     const providerId = String(req.params.id).toLowerCase();
-    const res = await query(
-      `SELECT * FROM providers WHERE project_id = $1 AND provider_id = $2`,
+    const connRes = await query(
+      `SELECT * FROM provider_connections WHERE project_id = $1 AND provider = $2`,
       [auth.projectId, providerId]
     );
 
-    if (res.rows.length === 0) {
-      reply.status(404).send({
-        error: { message: `Provider '${providerId}' not found.`, code: 5, requestId: req.requestId },
-      });
-      return;
-    }
+    const isConnected = connRes.rows.length > 0 && connRes.rows[0].status === 'connected';
+    const conn = connRes.rows[0];
 
-    const r = res.rows[0];
     return {
-      id: r.provider_id,
-      name: r.provider_id.charAt(0).toUpperCase() + r.provider_id.slice(1),
-      status: r.status,
-      environment: r.environment,
-      capabilities: r.capabilities,
-      webhooksReceiving: r.status === 'connected',
-      lastSuccessfulRequest: r.last_request_at || '12 seconds ago',
+      id: providerId,
+      name: providerId.charAt(0).toUpperCase() + providerId.slice(1),
+      status: isConnected ? 'connected' : 'available',
+      environment: conn?.environment || auth.environment,
+      capabilities: ['Card', 'Bank transfer', 'USSD'],
+      webhooksReceiving: isConnected,
+      lastSuccessfulRequest: conn?.last_request_at || '12 seconds ago',
     };
   });
 
@@ -472,7 +829,7 @@ export function buildApp(): FastifyInstance {
     const activeMarkets = marketRes.rows.map((r) => r.name);
 
     const provRes = await query(
-      `SELECT * FROM providers WHERE project_id = $1 AND status = 'connected'`,
+      `SELECT id FROM provider_connections WHERE project_id = $1 AND status = 'connected'`,
       [auth.projectId]
     );
     const providerConnected = provRes.rows.length > 0;

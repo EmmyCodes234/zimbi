@@ -47,6 +47,30 @@ CREATE TABLE IF NOT EXISTS providers (
   CONSTRAINT uq_project_provider UNIQUE (project_id, provider_id, environment)
 );
 
+-- Provider Connections (Merchant-Owned Accounts)
+CREATE TABLE IF NOT EXISTS provider_connections (
+  id VARCHAR(64) PRIMARY KEY,
+  project_id VARCHAR(64) NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  provider VARCHAR(64) NOT NULL,
+  environment VARCHAR(32) NOT NULL DEFAULT 'test',
+  display_name VARCHAR(128),
+  status VARCHAR(32) NOT NULL DEFAULT 'connected',
+  credential_ciphertext TEXT NOT NULL,
+  credential_iv VARCHAR(64) NOT NULL,
+  credential_auth_tag VARCHAR(64) NOT NULL,
+  credential_key_version INT NOT NULL DEFAULT 1,
+  external_account_id VARCHAR(128),
+  capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+  last_validated_at TIMESTAMPTZ,
+  last_request_at TIMESTAMPTZ,
+  last_error_code VARCHAR(64),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  revoked_at TIMESTAMPTZ,
+  CONSTRAINT uq_project_provider_env UNIQUE (project_id, provider, environment)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_connections_project ON provider_connections(project_id, provider, environment);
+
 -- Payments
 CREATE TABLE IF NOT EXISTS payments (
   id VARCHAR(64) PRIMARY KEY,
@@ -57,6 +81,7 @@ CREATE TABLE IF NOT EXISTS payments (
   payment_method VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL DEFAULT 'pending', -- pending, processing, succeeded, failed
   provider_id VARCHAR(64) NOT NULL,
+  provider_connection_id VARCHAR(64) REFERENCES provider_connections(id),
   provider_reference VARCHAR(128),
   authorization_url TEXT,
   request_id VARCHAR(64),
@@ -64,6 +89,8 @@ CREATE TABLE IF NOT EXISTS payments (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider_connection_id VARCHAR(64) REFERENCES provider_connections(id);
+CREATE INDEX IF NOT EXISTS idx_payments_provider_conn ON payments(provider_connection_id);
 CREATE INDEX IF NOT EXISTS idx_payments_provider_ref ON payments(provider_reference);
 CREATE INDEX IF NOT EXISTS idx_payments_project ON payments(project_id);
 

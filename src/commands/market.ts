@@ -51,6 +51,18 @@ export async function runMarketAdd(country: string, options: GlobalOptions): Pro
     });
   }
 
+  if (market.code === 'NG') {
+    const provider = await client.getProvider('paystack');
+    if (!provider || provider.status !== 'connected') {
+      throw new ZimbiError({
+        message: "Cannot enable Nigeria (NG) market without an active Paystack connection.",
+        reason: "ZIMBI requires a verified merchant Paystack connection before activating Nigeria payments.",
+        fix: "Connect Paystack first: zimbi provider connect paystack",
+        exitCode: ExitCodes.CONFIG_FAILURE,
+      });
+    }
+  }
+
   if (options.json) {
     const updated = await client.enableMarket(country);
     outputJson({

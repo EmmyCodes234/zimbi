@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { query } from '../db/connection.js';
 import { PaystackProvider } from '../providers/paystack.js';
+import { decryptSecret } from '../auth/encryption.js';
 import {
   canTransition,
   assertValidTransition,
@@ -16,32 +17,21 @@ export interface WebhookIngestionResult {
 }
 
 export class WebhookIngestionService {
-  private paystackProvider: PaystackProvider;
-
-  constructor() {
-    this.paystackProvider = new PaystackProvider({ environment: 'test' });
-  }
-
   async processPaystackWebhook(
     signature: string | undefined,
     rawBody: string | undefined
   ): Promise<WebhookIngestionResult> {
-    if (!rawBody) {
+    if (!rawBody || !signature) {
       return {
         accepted: false,
         duplicate: false,
         signatureVerified: false,
         paymentUpdated: false,
-        error: 'Missing raw webhook body',
+        error: 'Missing raw webhook body or x-paystack-signature header',
       };
     }
 
-    // 1. Signature Verification
-    const signatureVerified = this.paystackProvider.verifyWebhookSignature(
-      signature || '',
-      rawBody
-    );
-
+    // Step 1: Parse JSON safely to extract candidate reference/id
     let parsedPayload: any;
     try {
       parsedPayload = JSON.parse(rawBody);
@@ -49,22 +39,116 @@ export class WebhookIngestionService {
       return {
         accepted: false,
         duplicate: false,
-        signatureVerified,
+        signatureVerified: false,
         paymentUpdated: false,
         error: 'Invalid JSON payload',
       };
     }
 
-    const eventType = String(parsedPayload.event || 'unknown');
     const data = parsedPayload.data || {};
-    const providerTransactionId = String(data.reference || data.id || crypto.randomUUID());
+    const reference = String(data.reference || data.id || '');
+    const eventType = String(parsedPayload.event || 'unknown');
+    const providerTransactionId = reference || crypto.randomUUID();
     const providerEventId = String(
       parsedPayload.id || parsedPayload.event_id || data.id || ''
     ) || null;
     const payloadHash = crypto.createHash('sha256').update(rawBody).digest('hex');
     const eventId = `wh_evt_${crypto.randomBytes(8).toString('hex')}`;
 
-    // 2. Idempotency Check & Ingestion
+    // Step 2: Query candidate payment to resolve owning provider_connection and secret key
+    let secretKey = '';
+    let candidatePayment: any = null;
+
+    if (reference) {
+      const payRes = await query(
+        `SELECT p.id, p.status, p.amount_minor, p.currency, p.project_id, p.provider_connection_id,
+                pc.credential_ciphertext, pc.credential_iv, pc.credential_auth_tag, pc.credential_key_version
+         FROM payments p
+         LEFT JOIN provider_connections pc ON p.provider_connection_id = pc.id
+         WHERE p.provider_reference = $1`,
+        [reference]
+      );
+
+      if (payRes.rows.length > 0) {
+        candidatePayment = payRes.rows[0];
+        if (candidatePayment.credential_ciphertext) {
+          try {
+            secretKey = decryptSecret({
+              ciphertext: candidatePayment.credential_ciphertext,
+              iv: candidatePayment.credential_iv,
+              authTag: candidatePayment.credential_auth_tag,
+              keyVersion: candidatePayment.credential_key_version,
+            });
+          } catch (decErr: any) {
+            console.warn('Failed to decrypt connection secret for webhook:', decErr.message);
+          }
+        }
+      }
+    }
+
+    // Fallback if no payment or payment had no connection: check active paystack connection
+    if (!secretKey) {
+      const connRes = await query(
+        `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
+         FROM provider_connections
+         WHERE provider = 'paystack' AND status = 'connected'
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      );
+      if (connRes.rows.length > 0) {
+        const conn = connRes.rows[0];
+        try {
+          secretKey = decryptSecret({
+            ciphertext: conn.credential_ciphertext,
+            iv: conn.credential_iv,
+            authTag: conn.credential_auth_tag,
+            keyVersion: conn.credential_key_version,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (!secretKey) {
+      return {
+        accepted: false,
+        duplicate: false,
+        signatureVerified: false,
+        paymentUpdated: false,
+        error: 'No active provider connection found to verify webhook signature',
+      };
+    }
+
+    // Step 3: STRICT SIGNATURE-FIRST VERIFICATION
+    // Verify HMAC-SHA512 BEFORE trusting payload, modifying database state, or processing payment.
+    const paystackProvider = new PaystackProvider({ secretKey });
+    const signatureVerified = paystackProvider.verifyWebhookSignature(signature, rawBody);
+
+    if (!signatureVerified) {
+      // Store unverified audit event with rejected status
+      try {
+        await query(
+          `INSERT INTO webhook_events (
+            id, provider, event_type, provider_event_id, provider_transaction_id,
+            payload_hash, signature_verified, processing_status, error_message, payload, received_at
+          ) VALUES ($1, 'paystack', $2, $3, $4, $5, false, 'rejected', 'Invalid HMAC-SHA512 signature', $6, NOW())`,
+          [eventId, eventType, providerEventId, providerTransactionId, payloadHash, parsedPayload]
+        );
+      } catch (err: any) {
+        console.warn('Failed to log rejected webhook event:', err.message);
+      }
+
+      return {
+        accepted: false,
+        duplicate: false,
+        signatureVerified: false,
+        paymentUpdated: false,
+        error: 'Invalid webhook signature - rejected prior to state change',
+      };
+    }
+
+    // Step 4: Idempotency Check & Ingestion for authenticated webhook
     try {
       await query(
         `INSERT INTO webhook_events (
@@ -79,7 +163,7 @@ export class WebhookIngestionService {
           providerEventId,
           providerTransactionId,
           payloadHash,
-          signatureVerified,
+          true,
           parsedPayload,
         ]
       );
@@ -98,7 +182,7 @@ export class WebhookIngestionService {
       return {
         accepted: true,
         duplicate: true,
-        signatureVerified,
+        signatureVerified: true,
         paymentUpdated: false,
       };
     }

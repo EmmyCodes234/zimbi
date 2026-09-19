@@ -32,11 +32,30 @@ export interface ProviderVerificationResult {
   raw?: any;
 }
 
+export interface ProviderValidationResult {
+  valid: boolean;
+  provider: string;
+  environment: 'test' | 'production';
+  message?: string;
+  raw?: any;
+}
+
+export interface ProviderCapabilities {
+  provider: string;
+  market: string;
+  currencies: string[];
+  paymentMethods: string[];
+  features: string[];
+}
+
 export interface PaymentProvider {
   readonly id: string;
   readonly environment: 'test' | 'production';
+  validateCredentials(): Promise<ProviderValidationResult>;
+  getCapabilities(marketCode?: string): ProviderCapabilities;
   initializeTransaction(params: InitializePaymentParams): Promise<ProviderTransactionResult>;
   verifyTransaction(reference: string): Promise<ProviderVerificationResult>;
   verifyWebhookSignature(signature: string, rawBody: string): boolean;
   parseWebhookEvent(rawBody: string): any;
 }
+

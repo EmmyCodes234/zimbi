@@ -520,6 +520,30 @@ export class ZimbiApiClient {
     }
   }
 
+  // --- Provider Connections (Merchant-Owned) ---
+  async listProviderConnections(): Promise<any[]> {
+    const apiRes = await this.fetchApi<{ connections: any[] }>('/v1/provider-connections');
+    return apiRes?.connections || [];
+  }
+
+  async createProviderConnection(params: {
+    provider: string;
+    secretKey: string;
+    environment?: EnvironmentMode;
+  }): Promise<any> {
+    return this.fetchApi('/v1/provider-connections', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async validateProviderConnection(id: string): Promise<any> {
+    return this.fetchApi(`/v1/provider-connections/${id}/validate`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+  }
+
   // --- Payments (Unified POST /v1/payments) ---
   async createPayment(params: {
     market: string;

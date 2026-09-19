@@ -123,8 +123,9 @@ providerCmd
 providerCmd
   .command('connect [provider]')
   .description('Connect a provider account (e.g. paystack)')
-  .action(async (provider) => {
-    await runProviderConnect(provider, getGlobalOpts());
+  .option('--stdin', 'Read secret key from standard input')
+  .action(async (provider, cmdOpts) => {
+    await runProviderConnect(provider, { ...getGlobalOpts(), ...cmdOpts });
   });
 
 providerCmd

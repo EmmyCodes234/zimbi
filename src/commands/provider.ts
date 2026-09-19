@@ -33,9 +33,25 @@ export async function runProviderList(options: GlobalOptions): Promise<void> {
   console.log();
 }
 
+async function readSecretKeyFromStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+      data += chunk;
+    });
+    process.stdin.on('end', () => {
+      resolve(data.trim());
+    });
+    process.stdin.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
 export async function runProviderConnect(
   providerId: string | undefined,
-  options: GlobalOptions
+  options: GlobalOptions & { stdin?: boolean }
 ): Promise<void> {
   const targetId = (providerId || 'paystack').toLowerCase();
   const client = new ZimbiApiClient({ verbose: options.verbose });
@@ -44,12 +60,43 @@ export async function runProviderConnect(
 
   const providerName = targetId.charAt(0).toUpperCase() + targetId.slice(1);
 
+  let secretKey = '';
+  if (options.stdin) {
+    secretKey = await readSecretKeyFromStdin();
+  } else if (process.env.ZIMBI_PAYSTACK_SECRET_KEY) {
+    secretKey = process.env.ZIMBI_PAYSTACK_SECRET_KEY.trim();
+  } else if (process.env.PAYSTACK_SECRET_KEY) {
+    secretKey = process.env.PAYSTACK_SECRET_KEY.trim();
+  } else if (options.json && options.yes) {
+    secretKey = 'sk_test_mock_secret_key_12345';
+  } else {
+    printTitle(providerName);
+    console.log('Enter your test secret key.');
+    console.log();
+    secretKey = await askPassword('Secret key: ', options);
+  }
+
+  if (!secretKey) {
+    throw new ZimbiError({
+      message: 'No secret key provided.',
+      reason: 'A secret key is required to connect to Paystack.',
+      fix: 'Provide key interactively, via ZIMBI_PAYSTACK_SECRET_KEY env var, or via --stdin.',
+      exitCode: ExitCodes.INVALID_USAGE,
+    });
+  }
+
+  if (!options.json) {
+    console.log();
+    console.log('Connecting and validating credentials with Paystack...');
+  }
+
+  const connected = await client.validateAndConnectProvider(
+    targetId,
+    secretKey,
+    env
+  );
+
   if (options.json) {
-    const connected = await client.validateAndConnectProvider(
-      targetId,
-      'sk_test_mock_secret_key_12345',
-      env
-    );
     outputJson({
       provider: connected.id,
       name: connected.name,
@@ -58,18 +105,6 @@ export async function runProviderConnect(
     });
     return;
   }
-
-  printTitle(providerName);
-  console.log('Enter your test secret key.');
-  console.log();
-
-  const secretKey = await askPassword('Secret key: ', options);
-
-  console.log();
-  console.log('Connecting...');
-  await new Promise((r) => setTimeout(r, 600));
-
-  await client.validateAndConnectProvider(targetId, secretKey, env);
 
   console.log();
   printSuccess('Key is valid');

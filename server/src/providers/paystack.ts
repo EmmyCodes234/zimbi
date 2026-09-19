@@ -5,7 +5,10 @@ import type {
   ProviderTransactionResult,
   ProviderVerificationResult,
   ProviderVerificationStatus,
+  ProviderValidationResult,
+  ProviderCapabilities,
 } from './types.js';
+import { redactSecrets } from '../auth/redaction.js';
 
 export interface PaystackProviderOptions {
   environment?: 'test' | 'production';
@@ -20,12 +23,132 @@ export class PaystackProvider implements PaymentProvider {
 
   constructor(options: PaystackProviderOptions = {}) {
     this.environment = options.environment || 'test';
-    this.secretKey =
-      options.secretKey ||
-      (this.environment === 'production'
-        ? process.env.PAYSTACK_LIVE_SECRET_KEY || ''
-        : process.env.PAYSTACK_TEST_SECRET_KEY || 'sk_test_demo_key_placeholder');
+    this.secretKey = options.secretKey || '';
   }
+
+  /**
+   * Validates credentials against Paystack's live API:
+   * GET https://api.paystack.co/balance
+   * Verifies authentication, environment prefix, and API reachability.
+   */
+  async validateCredentials(): Promise<ProviderValidationResult> {
+    if (!this.secretKey || this.secretKey.trim().length === 0) {
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: 'No secret key provided.',
+      };
+    }
+
+    const trimmedKey = this.secretKey.trim();
+
+    // Verify key prefix matches target environment
+    if (this.environment === 'test' && !trimmedKey.startsWith('sk_test_')) {
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: 'Invalid key prefix: test environment requires a secret key starting with sk_test_.',
+      };
+    }
+    if (this.environment === 'production' && !trimmedKey.startsWith('sk_live_')) {
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: 'Invalid key prefix: live environment requires a secret key starting with sk_live_.',
+      };
+    }
+
+    // Mock test key support for deterministic offline/unit tests
+    if (trimmedKey === 'sk_test_mock_secret_key_12345') {
+      return {
+        valid: true,
+        provider: 'paystack',
+        environment: this.environment,
+        message: 'Mock test key validated successfully.',
+      };
+    }
+    if (trimmedKey === 'sk_test_invalid_mock_key') {
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: 'Invalid Paystack secret key (mock rejection).',
+      };
+    }
+
+    // Real Paystack validation via GET /balance
+    try {
+      const res = await fetch(`${this.apiBaseUrl}/balance`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${trimmedKey}`,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const body = (await res.json().catch(() => ({}))) as any;
+
+      if (res.status === 200 && body.status === true) {
+        return {
+          valid: true,
+          provider: 'paystack',
+          environment: this.environment,
+          message: 'Paystack credentials verified successfully.',
+          raw: {
+            currencies: Array.isArray(body.data) ? body.data.map((d: any) => d.currency) : [],
+          },
+        };
+      }
+
+      if (res.status === 401 || body.message?.toLowerCase().includes('invalid key')) {
+        return {
+          valid: false,
+          provider: 'paystack',
+          environment: this.environment,
+          message: 'Invalid Paystack secret key. Authentication was rejected by Paystack.',
+        };
+      }
+
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: redactSecrets(body.message || `Paystack API returned HTTP ${res.status}`),
+      };
+    } catch (err: any) {
+      return {
+        valid: false,
+        provider: 'paystack',
+        environment: this.environment,
+        message: `Unable to reach Paystack API: ${redactSecrets(err.message || 'Connection timeout')}`,
+      };
+    }
+  }
+
+  getCapabilities(marketCode: string = 'NG'): ProviderCapabilities {
+    const market = marketCode.toUpperCase();
+    if (market === 'NG') {
+      return {
+        provider: 'paystack',
+        market: 'NG',
+        currencies: ['NGN'],
+        paymentMethods: ['card', 'bank_transfer', 'ussd'],
+        features: ['webhooks', 'reconciliation', 'idempotency'],
+      };
+    }
+
+    return {
+      provider: 'paystack',
+      market,
+      currencies: [],
+      paymentMethods: [],
+      features: [],
+    };
+  }
+
 
   async initializeTransaction(
     params: InitializePaymentParams
@@ -52,7 +175,11 @@ export class PaystackProvider implements PaymentProvider {
       metadata: params.metadata,
     };
 
-    if (this.secretKey === 'sk_test_demo_key_placeholder' || this.secretKey === 'sk_test_mock_secret_key_12345') {
+    if (!this.secretKey) {
+      throw new Error('Paystack secret key is required to initialize transaction.');
+    }
+
+    if (this.secretKey === 'sk_test_mock_secret_key_12345' || this.secretKey === 'sk_test_demo_key_placeholder') {
       return {
         providerReference: params.reference,
         authorizationUrl: `https://checkout.paystack.com/${params.reference.toLowerCase()}`,
@@ -93,9 +220,12 @@ export class PaystackProvider implements PaymentProvider {
     if (!reference) {
       throw new Error('Transaction reference is required for verification');
     }
+    if (!this.secretKey) {
+      throw new Error('Paystack secret key is required for transaction verification.');
+    }
 
-    // Support deterministic testing when using demo / mock secret key
-    if (this.secretKey === 'sk_test_demo_key_placeholder' || this.secretKey === 'sk_test_mock_secret_key_12345') {
+    // Support deterministic testing when using mock secret key
+    if (this.secretKey === 'sk_test_mock_secret_key_12345' || this.secretKey === 'sk_test_demo_key_placeholder') {
       if (reference.includes('mock_fail')) {
         return {
           status: 'failed',

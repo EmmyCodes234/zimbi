@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { query } from '../db/connection.js';
 import { PaystackProvider } from '../providers/paystack.js';
+import { decryptSecret } from '../auth/encryption.js';
 import {
   canTransition,
   assertValidTransition,
@@ -28,6 +29,7 @@ export interface PaymentDetails {
   status: PaymentStatus;
   provider: string;
   providerReference?: string;
+  providerConnectionId?: string;
   authorizationUrl?: string;
   requestId?: string;
   createdAt: string;
@@ -75,7 +77,33 @@ export class PaymentEngine {
     const currency = marketRes.rows.length > 0 ? marketRes.rows[0].currency : 'NGN';
     const amountMinor = Math.round(input.amount * 100); // ₦20,000 -> 2,000,000 kobo
 
-    // 2. Select channel
+    // 2. Resolve merchant-owned provider connection
+    // GOLDEN RULE: NO MERCHANT CONNECTION = NO MERCHANT PAYMENT.
+    const connRes = await query(
+      `SELECT id, provider, environment, credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version, status
+       FROM provider_connections
+       WHERE project_id = $1 AND provider = 'paystack' AND environment = $2 AND status = 'connected'`,
+      [input.projectId, environment]
+    );
+
+    if (connRes.rows.length === 0) {
+      throw new Error(
+        `ZIMBI needs an active Paystack connection for this project in ${environment} mode. ` +
+        `A merchant-owned provider connection is required before creating payments. Run: zimbi provider connect paystack`
+      );
+    }
+
+    const connection = connRes.rows[0];
+
+    // Decrypt merchant credential in memory
+    const secretKey = decryptSecret({
+      ciphertext: connection.credential_ciphertext,
+      iv: connection.credential_iv,
+      authTag: connection.credential_auth_tag,
+      keyVersion: connection.credential_key_version,
+    });
+
+    // 3. Select channel
     const channelMap: Record<string, string> = {
       'Card': 'card',
       'Bank transfer': 'bank_transfer',
@@ -83,11 +111,11 @@ export class PaymentEngine {
     };
     const channels = [channelMap[input.paymentMethod] || 'card'];
 
-    // 3. Instantiate provider
-    const provider = new PaystackProvider({ environment });
+    // 4. Instantiate provider with merchant-owned secret key
+    const provider = new PaystackProvider({ environment, secretKey });
     const reference = `${paymentId}_ref`;
 
-    // 4. Initialize transaction with Paystack API
+    // 5. Initialize transaction with Paystack API
     const trxResult = await provider.initializeTransaction({
       amountMinor,
       currency,
@@ -97,16 +125,17 @@ export class PaymentEngine {
       metadata: {
         paymentId,
         projectId: input.projectId,
+        providerConnectionId: connection.id,
         environment,
       },
     });
 
-    // 5. Insert payment row into PostgreSQL
+    // 6. Insert payment row into PostgreSQL with provider_connection_id
     await query(
       `INSERT INTO payments (
         id, project_id, market_code, amount_minor, currency, payment_method,
-        status, provider_id, provider_reference, authorization_url, request_id, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())`,
+        status, provider_id, provider_connection_id, provider_reference, authorization_url, request_id, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())`,
       [
         paymentId,
         input.projectId,
@@ -116,10 +145,17 @@ export class PaymentEngine {
         input.paymentMethod,
         'pending',
         'paystack',
+        connection.id,
         trxResult.providerReference,
         trxResult.authorizationUrl,
         requestId,
       ]
+    );
+
+    // Update connection last_request_at
+    await query(
+      `UPDATE provider_connections SET last_request_at = NOW() WHERE id = $1`,
+      [connection.id]
     );
 
     const formattedAmount =
@@ -138,6 +174,7 @@ export class PaymentEngine {
       status: 'pending',
       provider: 'Paystack',
       providerReference: trxResult.providerReference,
+      providerConnectionId: connection.id,
       authorizationUrl: trxResult.authorizationUrl,
       requestId,
       createdAt: new Date().toISOString(),
@@ -194,6 +231,7 @@ export class PaymentEngine {
       status: row.status as PaymentStatus,
       provider: 'Paystack',
       providerReference: row.provider_reference,
+      providerConnectionId: row.provider_connection_id || undefined,
       authorizationUrl: row.authorization_url,
       requestId: row.request_id,
       createdAt: row.created_at,
@@ -238,9 +276,43 @@ export class PaymentEngine {
       };
     }
 
-    // Provider check
+    // Resolve merchant secret key for verification
+    let secretKey = '';
+    if (row.provider_connection_id) {
+      const connRes = await query(
+        `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
+         FROM provider_connections WHERE id = $1`,
+        [row.provider_connection_id]
+      );
+      if (connRes.rows.length > 0) {
+        const conn = connRes.rows[0];
+        secretKey = decryptSecret({
+          ciphertext: conn.credential_ciphertext,
+          iv: conn.credential_iv,
+          authTag: conn.credential_auth_tag,
+          keyVersion: conn.credential_key_version,
+        });
+      }
+    } else {
+      const connRes = await query(
+        `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
+         FROM provider_connections WHERE project_id = $1 AND provider = 'paystack' AND status = 'connected'`,
+        [row.project_id]
+      );
+      if (connRes.rows.length > 0) {
+        const conn = connRes.rows[0];
+        secretKey = decryptSecret({
+          ciphertext: conn.credential_ciphertext,
+          iv: conn.credential_iv,
+          authTag: conn.credential_auth_tag,
+          keyVersion: conn.credential_key_version,
+        });
+      }
+    }
+
+    // Provider check with decrypted merchant key
     const env = row.id.startsWith('pay_live_') ? 'production' : 'test';
-    const provider = new PaystackProvider({ environment: env });
+    const provider = new PaystackProvider({ environment: env, secretKey });
     const verification = await provider.verifyTransaction(reference);
 
     const providerStatus = verification.status;
