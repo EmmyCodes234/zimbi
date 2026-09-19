@@ -71,7 +71,7 @@ export class ZimbiApiClient {
           ...headers,
           ...(options.headers as Record<string, string>),
         },
-        signal: AbortSignal.timeout(3000), // 3s timeout for API reachability
+        signal: AbortSignal.timeout(15000), // 15s timeout for cloud APIs and provider verifications
       });
 
       const durationMs = Date.now() - startTime;
