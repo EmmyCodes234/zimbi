@@ -44,7 +44,9 @@ export async function generateProjectApiKey(
 }
 
 export async function verifyApiKey(bearerToken: string): Promise<AuthenticatedContext | null> {
-  if (!bearerToken || !bearerToken.startsWith('zmb_')) {
+  // Project API keys MUST start with zmb_test_ or zmb_live_
+  // Session tokens (zmb_sess_) are handled by verifyAccountSession
+  if (!bearerToken || (!bearerToken.startsWith('zmb_test_') && !bearerToken.startsWith('zmb_live_'))) {
     return null;
   }
 
@@ -62,6 +64,13 @@ export async function verifyApiKey(bearerToken: string): Promise<AuthenticatedCo
   }
 
   const row = result.rows[0];
+
+  // Asynchronously record last_used_at
+  query(
+    `UPDATE api_keys SET last_used_at = NOW() WHERE key_id = $1`,
+    [row.key_id]
+  ).catch(() => {});
+
   return {
     projectId: row.project_id,
     projectName: row.project_name,

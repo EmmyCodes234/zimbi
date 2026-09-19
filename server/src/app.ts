@@ -3,7 +3,20 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import rawBody from 'fastify-raw-body';
 import { checkDbConnection, query } from './db/connection.js';
-import { generateProjectApiKey, verifyApiKey } from './auth/keys.js';
+import { generateProjectApiKey, verifyApiKey, type AuthenticatedContext } from './auth/keys.js';
+import {
+  createOrGetAccount,
+  createAccountSession,
+  verifyAccountSession,
+  revokeAccountSession,
+  requestDeviceAuthorization,
+  getDeviceCodeDetails,
+  authorizeDeviceCode,
+  pollDeviceToken,
+  normalizeUserCode,
+  type AccountContext,
+} from './auth/sessions.js';
+import { renderDevicePage } from './auth/device-ui.js';
 import { encryptSecret, decryptSecret } from './auth/encryption.js';
 import { redactSecrets } from './auth/redaction.js';
 import { PaystackProvider } from './providers/paystack.js';
@@ -24,6 +37,20 @@ export function buildApp(): FastifyInstance {
     runFirst: true,
   });
 
+  // Support application/x-www-form-urlencoded natively for web forms
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (req, body, defaultDone) => {
+      try {
+        const parsed = Object.fromEntries(new URLSearchParams(body as string));
+        defaultDone(null, parsed);
+      } catch (err: any) {
+        defaultDone(err, undefined);
+      }
+    }
+  );
+
   // 2. Correlation ID Middleware
   app.addHook('onRequest', async (req, reply) => {
     const existing = req.headers['x-request-id'];
@@ -35,8 +62,8 @@ export function buildApp(): FastifyInstance {
     reply.header('x-request-id', reqId);
   });
 
-  // 3. Helper to authenticate requests (Bearer token)
-  const authenticate = async (req: any, reply: any) => {
+  // 3. Helper to authenticate Project API keys (zmb_test_... or zmb_live_...)
+  const authenticateProject = async (req: any, reply: any): Promise<AuthenticatedContext | null> => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       reply.status(401).send({
@@ -52,6 +79,20 @@ export function buildApp(): FastifyInstance {
     }
 
     const token = authHeader.replace('Bearer ', '').trim();
+
+    if (token.startsWith('zmb_sess_')) {
+      reply.status(403).send({
+        error: {
+          message: 'Project API key required for operational traffic.',
+          reason: 'An account session token was provided instead of a project API key.',
+          fix: 'Select an active project using `zimbi project use <id>` or pass ZIMBI_API_KEY.',
+          code: 3,
+          requestId: req.requestId,
+        },
+      });
+      return null;
+    }
+
     const context = await verifyApiKey(token);
     if (!context) {
       reply.status(401).send({
@@ -70,6 +111,71 @@ export function buildApp(): FastifyInstance {
     return context;
   };
 
+  // 4. Helper to authenticate Account Sessions (zmb_sess_...)
+  const authenticateSession = async (req: any, reply: any): Promise<AccountContext | null> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      reply.status(401).send({
+        error: {
+          message: 'Account authentication required.',
+          reason: 'Missing or invalid Authorization header.',
+          fix: 'Include Authorization: Bearer zmb_sess_... or run zimbi login.',
+          code: 3,
+          requestId: req.requestId,
+        },
+      });
+      return null;
+    }
+
+    const token = authHeader.replace('Bearer ', '').trim();
+
+    if (token.startsWith('zmb_test_') || token.startsWith('zmb_live_')) {
+      reply.status(403).send({
+        error: {
+          message: 'Account session token required for project discovery and management.',
+          reason: 'A project-scoped API key cannot discover or manage other projects.',
+          fix: 'Authenticate your account using `zimbi login`.',
+          code: 3,
+          requestId: req.requestId,
+        },
+      });
+      return null;
+    }
+
+    const context = await verifyAccountSession(token);
+    if (!context) {
+      reply.status(401).send({
+        error: {
+          message: 'Invalid or revoked account session.',
+          reason: 'The session token was not found, has expired, or was revoked.',
+          fix: 'Run `zimbi login` to authenticate.',
+          code: 3,
+          requestId: req.requestId,
+        },
+      });
+      return null;
+    }
+
+    req.account = context;
+    return context;
+  };
+
+  // CSRF token helpers for Device Flow
+  const generateCsrfToken = (userCode: string): string => {
+    const secret = process.env.ZIMBI_CREDENTIAL_ENCRYPTION_KEY || 'zimbi-csrf-default-secret';
+    return crypto.createHmac('sha256', secret).update(userCode || 'code').digest('hex');
+  };
+
+  const verifyCsrfToken = (userCode: string, token: string): boolean => {
+    if (!token) return false;
+    const expected = generateCsrfToken(userCode);
+    try {
+      return crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(expected, 'utf8'));
+    } catch {
+      return false;
+    }
+  };
+
   const paymentEngine = new PaymentEngine();
   const webhookService = new WebhookIngestionService();
 
@@ -84,20 +190,315 @@ export function buildApp(): FastifyInstance {
     };
   });
 
-  // --- Projects & Auth ---
+  // --- Vercel-Style Device Authorization Flow (RFC 8628) ---
+
+  // 1. Request device authorization (CLI)
+  app.post('/v1/auth/device/code', async (req: any, reply) => {
+    const body = req.body || {};
+    const clientMetadata = {
+      cliVersion: body.cliVersion || '0.1.0',
+      nodeVersion: body.nodeVersion || process.version,
+      platform: body.platform || process.platform,
+      arch: body.arch || process.arch,
+      ip: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1',
+      location: body.location || 'Local Development Environment',
+      timestamp: new Date().toUTCString().replace(/^[A-Za-z]+, /, '').replace(/ GMT$/, ' UTC'),
+    };
+
+    const deviceAuth = await requestDeviceAuthorization(clientMetadata);
+    reply.status(200).send(deviceAuth);
+  });
+
+  // 2. Hosted Device Authorization Web Page (Browser)
+  app.get('/device', async (req: any, reply) => {
+    const queryParams = (req.query as any) || {};
+    const rawCode = queryParams.code || '';
+    const userCode = normalizeUserCode(rawCode);
+
+    let clientMetadata: any = {};
+    let error: string | undefined;
+
+    if (userCode) {
+      const details = await getDeviceCodeDetails(userCode);
+      if (!details.valid) {
+        error = details.error;
+      } else {
+        clientMetadata = details.clientMetadata || {};
+      }
+    }
+
+    const csrfToken = generateCsrfToken(userCode);
+    const html = renderDevicePage({
+      userCode,
+      clientMetadata,
+      csrfToken,
+      error,
+    });
+
+    reply.type('text/html').send(html);
+  });
+
+  // 3. Device Authorization Verification (Browser Form Submission)
+  app.post('/v1/auth/device/verify', async (req: any, reply) => {
+    const body = req.body || {};
+    const rawCode = String(body.userCode || body.manualCode || '').trim();
+    const userCode = normalizeUserCode(rawCode);
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const csrfToken = String(body.csrfToken || '');
+
+    const isJson = req.headers['content-type']?.includes('application/json');
+
+    // Security Check 1: CSRF verification
+    if (!verifyCsrfToken(userCode, csrfToken)) {
+      if (isJson) {
+        reply.status(403).send({ error: { message: 'Invalid or expired CSRF token.' } });
+        return;
+      }
+      const html = renderDevicePage({
+        userCode,
+        csrfToken: generateCsrfToken(userCode),
+        error: 'Security verification failed (invalid CSRF token). Please try again.',
+      });
+      reply.type('text/html').send(html);
+      return;
+    }
+
+    // Security Check 2: Browser authentication required (email required)
+    if (!email || !email.includes('@')) {
+      if (isJson) {
+        reply.status(400).send({ error: { message: 'A valid developer email is required.' } });
+        return;
+      }
+      const html = renderDevicePage({
+        userCode,
+        csrfToken: generateCsrfToken(userCode),
+        error: 'Please enter a valid developer email to authenticate.',
+      });
+      reply.type('text/html').send(html);
+      return;
+    }
+
+    // Authenticate / create account
+    const account = await createOrGetAccount(email);
+
+    // Explicit approval
+    const result = await authorizeDeviceCode(userCode, account.id);
+
+    if (!result.success) {
+      if (isJson) {
+        reply.status(400).send({ error: { message: result.error } });
+        return;
+      }
+      const html = renderDevicePage({
+        userCode,
+        currentUserEmail: email,
+        csrfToken: generateCsrfToken(userCode),
+        error: result.error,
+      });
+      reply.type('text/html').send(html);
+      return;
+    }
+
+    if (isJson) {
+      reply.status(200).send({ success: true, account });
+      return;
+    }
+
+    const successHtml = renderDevicePage({
+      userCode,
+      currentUserEmail: account.email,
+      csrfToken: '',
+      success: true,
+    });
+    reply.type('text/html').send(successHtml);
+  });
+
+  // 4. Device Token Polling (CLI single-use token exchange)
+  app.post('/v1/auth/device/token', async (req: any, reply) => {
+    const body = req.body || {};
+    const deviceCode = String(body.deviceCode || '');
+
+    if (!deviceCode) {
+      reply.status(400).send({
+        error: { message: 'deviceCode is required.' },
+      });
+      return;
+    }
+
+    const pollResult = await pollDeviceToken(deviceCode);
+
+    if (pollResult.status === 'pending') {
+      reply.status(200).send({ status: 'pending' });
+      return;
+    }
+
+    if (pollResult.status === 'approved') {
+      reply.status(200).send({
+        status: 'approved',
+        sessionToken: pollResult.sessionToken,
+        account: pollResult.account,
+      });
+      return;
+    }
+
+    if (pollResult.status === 'expired') {
+      reply.status(400).send({
+        status: 'expired',
+        error: { message: 'Device authorization code has expired. Run zimbi login again.' },
+      });
+      return;
+    }
+
+    reply.status(400).send({
+      status: 'denied',
+      error: { message: pollResult.error || 'Device authorization was denied.' },
+    });
+  });
+
+  // 5. Account Session Revocation (CLI Logout)
+  app.post('/v1/auth/logout', async (req: any, reply) => {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.replace('Bearer ', '').trim();
+      if (token.startsWith('zmb_sess_')) {
+        const session = await verifyAccountSession(token);
+        if (session) {
+          await revokeAccountSession(session.sessionId);
+        }
+      }
+    }
+
+    reply.status(200).send({ loggedOut: true });
+  });
+
+  // 6. WhoAmI (Dual-Mode: session or project API key)
+  app.get('/v1/auth/whoami', async (req: any, reply) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      reply.status(401).send({
+        error: { message: 'Authentication required.' },
+      });
+      return;
+    }
+
+    const token = authHeader.replace('Bearer ', '').trim();
+
+    if (token.startsWith('zmb_sess_')) {
+      const account = await verifyAccountSession(token);
+      if (!account) {
+        reply.status(401).send({ error: { message: 'Invalid or revoked account session.' } });
+        return;
+      }
+      return {
+        type: 'account',
+        accountId: account.accountId,
+        email: account.email,
+        name: account.name,
+      };
+    }
+
+    const proj = await verifyApiKey(token);
+    if (!proj) {
+      reply.status(401).send({ error: { message: 'Invalid API key.' } });
+      return;
+    }
+
+    return {
+      type: 'project',
+      projectId: proj.projectId,
+      projectName: proj.projectName,
+      environment: proj.environment,
+      keyId: proj.keyId,
+    };
+  });
+
+  // 7. Get Current Account & Projects
+  app.get('/v1/auth/me', async (req: any, reply) => {
+    const account = await authenticateSession(req, reply);
+    if (!account) return;
+
+    const projRes = await query(
+      `SELECT id, name, environment, status, slug, created_at, updated_at
+       FROM projects
+       WHERE account_id = $1
+       ORDER BY created_at DESC`,
+      [account.accountId]
+    );
+
+    return {
+      account: {
+        id: account.accountId,
+        email: account.email,
+        name: account.name,
+      },
+      projects: projRes.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        environment: r.environment,
+        status: r.status,
+        slug: r.slug,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      })),
+    };
+  });
+
+  // --- Projects Management (Account-Scoped) ---
+
+  // List projects belonging strictly to the authenticated account
+  app.get('/v1/projects', async (req: any, reply) => {
+    const account = await authenticateSession(req, reply);
+    if (!account) return;
+
+    const res = await query(
+      `SELECT id, name, environment, status, slug, created_at, updated_at
+       FROM projects
+       WHERE account_id = $1
+       ORDER BY created_at DESC`,
+      [account.accountId]
+    );
+
+    return {
+      projects: res.rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        environment: r.environment,
+        status: r.status,
+        slug: r.slug,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      })),
+    };
+  });
+
+  // Create new project tied to authenticated account
   app.post('/v1/projects', async (req: any, reply) => {
+    // Check if caller provided account session token
+    let accountId = 'acc_default';
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.replace('Bearer ', '').trim();
+      if (token.startsWith('zmb_sess_')) {
+        const session = await verifyAccountSession(token);
+        if (session) {
+          accountId = session.accountId;
+        }
+      }
+    }
+
     const body = req.body || {};
     const name = body.name || 'acme';
     const env = body.environment || 'test';
+    const slug = body.slug || name.toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const id = `proj_${crypto.randomBytes(5).toString('hex')}`;
 
     await query(
-      `INSERT INTO projects (id, name, environment, created_at, updated_at)
-       VALUES ($1, $2, $3, NOW(), NOW())`,
-      [id, name, env]
+      `INSERT INTO projects (id, name, environment, account_id, slug, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'active', NOW(), NOW())`,
+      [id, name, env, accountId, slug]
     );
 
-    // Generate initial API key
+    // Generate initial API key for project
     const key = await generateProjectApiKey(id, env);
 
     // Seed default supported markets for this project
@@ -133,26 +534,46 @@ export function buildApp(): FastifyInstance {
       id,
       name,
       environment: env,
+      slug,
+      status: 'active',
       apiKey: key.plaintextKey,
       keyId: key.keyId,
     });
   });
 
-  app.get('/v1/auth/whoami', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
-    if (!auth) return;
+  // Generate an additional API key for an account's project
+  app.post('/v1/projects/:id/keys', async (req: any, reply) => {
+    const account = await authenticateSession(req, reply);
+    if (!account) return;
 
-    return {
-      projectId: auth.projectId,
-      projectName: auth.projectName,
-      environment: auth.environment,
-      keyId: auth.keyId,
-    };
+    const projectId = req.params.id;
+    const projCheck = await query(
+      `SELECT id, environment FROM projects WHERE id = $1 AND account_id = $2`,
+      [projectId, account.accountId]
+    );
+
+    if (projCheck.rows.length === 0) {
+      reply.status(404).send({
+        error: { message: `Project '${projectId}' not found in your account.` },
+      });
+      return;
+    }
+
+    const env = projCheck.rows[0].environment;
+    const key = await generateProjectApiKey(projectId, env);
+
+    reply.status(201).send({
+      projectId,
+      keyId: key.keyId,
+      apiKey: key.plaintextKey,
+      prefix: key.prefix,
+      environment: key.environment,
+    });
   });
 
-  // --- Markets ---
+  // --- Markets (Project-Scoped) ---
   app.get('/v1/markets', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const res = await query(
@@ -176,7 +597,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/markets/:code/enable', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const code = String(req.params.code).toUpperCase();
@@ -230,7 +651,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/markets/:code/disable', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const code = String(req.params.code).toUpperCase();
@@ -259,7 +680,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.get('/v1/markets/:code/status', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const code = String(req.params.code).toUpperCase();
@@ -278,7 +699,6 @@ export function buildApp(): FastifyInstance {
     const m = res.rows[0];
     const flags: Record<string, string> = { NG: '🇳🇬', US: '🇺🇸', GB: '🇬🇧' };
 
-    // Check if provider is connected
     const provRes = await query(
       `SELECT * FROM providers WHERE project_id = $1 AND status = 'connected'`,
       [auth.projectId]
@@ -299,9 +719,9 @@ export function buildApp(): FastifyInstance {
     };
   });
 
-  // --- Provider Connections (Merchant-Owned) ---
+  // --- Provider Connections (Strictly Scoped to Project) ---
   app.get('/v1/provider-connections', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const res = await query(
@@ -333,7 +753,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/provider-connections', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const body = req.body || {};
@@ -450,7 +870,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.get('/v1/provider-connections/:id', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const target = String(req.params.id);
@@ -490,7 +910,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/provider-connections/:id/validate', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const target = String(req.params.id);
@@ -530,8 +950,8 @@ export function buildApp(): FastifyInstance {
        SET last_validated_at = NOW(),
            last_error_code = $1,
            updated_at = NOW()
-       WHERE id = $2`,
-      [valResult.valid ? null : 'INVALID_CREDENTIALS', conn.id]
+       WHERE id = $2 AND project_id = $3`,
+      [valResult.valid ? null : 'INVALID_CREDENTIALS', conn.id, auth.projectId]
     );
 
     return {
@@ -543,7 +963,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/provider-connections/:id/disconnect', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const target = String(req.params.id);
@@ -577,9 +997,9 @@ export function buildApp(): FastifyInstance {
     };
   });
 
-  // --- Legacy Providers Endpoints (Maintained & Wired to Provider Connections) ---
+  // --- Legacy Providers Endpoints (Maintained & Scoped) ---
   app.get('/v1/providers', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const provRes = await query(
@@ -613,7 +1033,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/providers/:id/connect', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const providerId = String(req.params.id).toLowerCase();
@@ -621,7 +1041,6 @@ export function buildApp(): FastifyInstance {
     const secretKey = typeof body.secretKey === 'string' ? body.secretKey.trim() : '';
 
     if (secretKey) {
-      // Delegate to secure provider connections flow
       const connRes = await (app as any).inject({
         method: 'POST',
         url: '/v1/provider-connections',
@@ -642,7 +1061,6 @@ export function buildApp(): FastifyInstance {
       return;
     }
 
-    // Fallback: check if active connection already exists
     const existing = await query(
       `SELECT * FROM provider_connections WHERE project_id = $1 AND provider = $2 AND status = 'connected'`,
       [auth.projectId, providerId]
@@ -670,7 +1088,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/providers/:id/disconnect', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const providerId = String(req.params.id).toLowerCase();
@@ -693,7 +1111,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.get('/v1/providers/:id/status', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const providerId = String(req.params.id).toLowerCase();
@@ -716,9 +1134,9 @@ export function buildApp(): FastifyInstance {
     };
   });
 
-  // --- Payments ---
+  // --- Payments (Strictly Project-Scoped) ---
   app.post('/v1/payments', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const body = req.body || {};
@@ -749,7 +1167,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.get('/v1/payments/:id', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const paymentId = req.params.id;
@@ -770,7 +1188,7 @@ export function buildApp(): FastifyInstance {
   });
 
   app.post('/v1/payments/:id/reconcile', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const paymentId = req.params.id;
@@ -816,9 +1234,9 @@ export function buildApp(): FastifyInstance {
     }
   );
 
-  // --- Doctor Diagnostic Endpoint ---
+  // --- Doctor Diagnostic Endpoint (Strictly Project-Scoped) ---
   app.get('/v1/doctor', async (req: any, reply) => {
-    const auth = await authenticate(req, reply);
+    const auth = await authenticateProject(req, reply);
     if (!auth) return;
 
     const dbCheck = await checkDbConnection();
@@ -869,7 +1287,7 @@ export function buildApp(): FastifyInstance {
       credentialsValid: true,
       marketsEnabled: activeMarkets,
       providerConnected,
-      checkoutValid: activeMarkets.length > 0 && providerConnected,
+      checkoutReady: activeMarkets.length > 0 && providerConnected,
       webhooksReachable: providerConnected,
       signatureVerificationEnabled: true,
       issues,

@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsx src/index.ts",
-    "test": "node --test dist/test/*.test.js || tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts"
   },
   "keywords": [
     "zimbi",

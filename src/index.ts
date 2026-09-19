@@ -1,7 +1,13 @@
 import { Command } from 'commander';
 import { runRootCommand } from './commands/root.js';
 import { runInitCommand } from './commands/init.js';
-import { runLoginCommand, runLogoutCommand, runWhoamiCommand } from './commands/login.js';
+import { runLoginCommand, runLogoutCommand, runWhoamiCommand } from './commands/auth.js';
+import {
+  runProjectListCommand,
+  runProjectCurrentCommand,
+  runProjectUseCommand,
+  runProjectCreateCommand,
+} from './commands/project.js';
 import {
   runMarketList,
   runMarketAdd,
@@ -77,6 +83,39 @@ program
   .description('View active user session and project')
   .action(() => {
     runWhoamiCommand(getGlobalOpts());
+  });
+
+// Project commands
+const projectCmd = program.command('project').description('Manage ZIMBI projects in your account');
+
+projectCmd
+  .command('list')
+  .description('List projects in your account')
+  .action(async () => {
+    await runProjectListCommand(getGlobalOpts());
+  });
+
+projectCmd
+  .command('current')
+  .description('Display the active project in this directory')
+  .action(async () => {
+    await runProjectCurrentCommand(getGlobalOpts());
+  });
+
+projectCmd
+  .command('use <projectId>')
+  .description('Switch this directory to a project in your account')
+  .option('--env <environment>', 'Environment (test or production)')
+  .action(async (projectId, cmdOpts) => {
+    await runProjectUseCommand(projectId, { ...getGlobalOpts(), ...cmdOpts });
+  });
+
+projectCmd
+  .command('create <name>')
+  .description('Create a new project in your account')
+  .option('--env <environment>', 'Environment (test or production)')
+  .action(async (name, cmdOpts) => {
+    await runProjectCreateCommand(name, { ...getGlobalOpts(), ...cmdOpts });
   });
 
 // Market commands

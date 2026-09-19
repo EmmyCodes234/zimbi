@@ -55,85 +55,96 @@ export class WebhookIngestionService {
     const payloadHash = crypto.createHash('sha256').update(rawBody).digest('hex');
     const eventId = `wh_evt_${crypto.randomBytes(8).toString('hex')}`;
 
-    // Step 2: Query candidate payment to resolve owning provider_connection and secret key
-    let secretKey = '';
-    let candidatePayment: any = null;
-
-    if (reference) {
-      const payRes = await query(
-        `SELECT p.id, p.status, p.amount_minor, p.currency, p.project_id, p.provider_connection_id,
-                pc.credential_ciphertext, pc.credential_iv, pc.credential_auth_tag, pc.credential_key_version
-         FROM payments p
-         LEFT JOIN provider_connections pc ON p.provider_connection_id = pc.id
-         WHERE p.provider_reference = $1`,
-        [reference]
-      );
-
-      if (payRes.rows.length > 0) {
-        candidatePayment = payRes.rows[0];
-        if (candidatePayment.credential_ciphertext) {
-          try {
-            secretKey = decryptSecret({
-              ciphertext: candidatePayment.credential_ciphertext,
-              iv: candidatePayment.credential_iv,
-              authTag: candidatePayment.credential_auth_tag,
-              keyVersion: candidatePayment.credential_key_version,
-            });
-          } catch (decErr: any) {
-            console.warn('Failed to decrypt connection secret for webhook:', decErr.message);
-          }
-        }
-      }
-    }
-
-    // Fallback if no payment or payment had no connection: check active paystack connection
-    if (!secretKey) {
-      const connRes = await query(
-        `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
-         FROM provider_connections
-         WHERE provider = 'paystack' AND status = 'connected'
-         ORDER BY updated_at DESC
-         LIMIT 1`
-      );
-      if (connRes.rows.length > 0) {
-        const conn = connRes.rows[0];
-        try {
-          secretKey = decryptSecret({
-            ciphertext: conn.credential_ciphertext,
-            iv: conn.credential_iv,
-            authTag: conn.credential_auth_tag,
-            keyVersion: conn.credential_key_version,
-          });
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    if (!secretKey) {
+    if (!reference) {
       return {
         accepted: false,
         duplicate: false,
         signatureVerified: false,
         paymentUpdated: false,
-        error: 'No active provider connection found to verify webhook signature',
+        error: 'Missing payment reference in webhook payload',
       };
     }
 
-    // Step 3: STRICT SIGNATURE-FIRST VERIFICATION
-    // Verify HMAC-SHA512 BEFORE trusting payload, modifying database state, or processing payment.
-    const paystackProvider = new PaystackProvider({ secretKey });
-    const signatureVerified = paystackProvider.verifyWebhookSignature(signature, rawBody);
+    // Step 2: Query candidate payment and owning connection strictly by immutable provider_reference
+    // ZERO-FALLBACK RULE: No global provider connection fallbacks permitted!
+    const payRes = await query(
+      `SELECT p.id, p.status, p.amount_minor, p.currency, p.project_id, p.provider_connection_id,
+              pc.credential_ciphertext, pc.credential_iv, pc.credential_auth_tag, pc.credential_key_version, pc.status as connection_status
+       FROM payments p
+       JOIN provider_connections pc ON p.provider_connection_id = pc.id
+       WHERE p.provider_reference = $1`,
+      [reference]
+    );
 
-    if (!signatureVerified) {
-      // Store unverified audit event with rejected status
+    if (payRes.rows.length === 0) {
+      // Record rejected audit event without decrypting any keys
       try {
         await query(
           `INSERT INTO webhook_events (
             id, provider, event_type, provider_event_id, provider_transaction_id,
             payload_hash, signature_verified, processing_status, error_message, payload, received_at
-          ) VALUES ($1, 'paystack', $2, $3, $4, $5, false, 'rejected', 'Invalid HMAC-SHA512 signature', $6, NOW())`,
+          ) VALUES ($1, 'paystack', $2, $3, $4, $5, false, 'rejected', 'No matching candidate payment or connected provider connection found for reference', $6, NOW())`,
           [eventId, eventType, providerEventId, providerTransactionId, payloadHash, parsedPayload]
+        );
+      } catch (err: any) {
+        console.warn('Failed to log rejected webhook event:', err.message);
+      }
+
+      return {
+        accepted: false,
+        duplicate: false,
+        signatureVerified: false,
+        paymentUpdated: false,
+        error: 'No matching payment and connection found for reference',
+      };
+    }
+
+    const candidatePayment = payRes.rows[0];
+
+    // Step 3: Decrypt connection secret in memory ONLY after candidate payment is located
+    let secretKey = '';
+    try {
+      secretKey = decryptSecret({
+        ciphertext: candidatePayment.credential_ciphertext,
+        iv: candidatePayment.credential_iv,
+        authTag: candidatePayment.credential_auth_tag,
+        keyVersion: candidatePayment.credential_key_version,
+      });
+    } catch (decErr: any) {
+      console.warn('Failed to decrypt connection secret for webhook:', decErr.message);
+      return {
+        accepted: false,
+        duplicate: false,
+        signatureVerified: false,
+        paymentUpdated: false,
+        error: 'Failed to decrypt provider credentials for webhook verification',
+      };
+    }
+
+    // Step 4: STRICT SIGNATURE-FIRST VERIFICATION
+    // Verify HMAC-SHA512 BEFORE trusting payload, modifying database state, or processing payment.
+    const paystackProvider = new PaystackProvider({ secretKey });
+    const signatureVerified = paystackProvider.verifyWebhookSignature(signature, rawBody);
+
+    if (!signatureVerified) {
+      // Store unverified audit event with rejected status and tenant context
+      try {
+        await query(
+          `INSERT INTO webhook_events (
+            id, project_id, provider_connection_id, payment_id, provider, event_type, provider_event_id, provider_transaction_id,
+            payload_hash, signature_verified, processing_status, error_message, payload, received_at
+          ) VALUES ($1, $2, $3, $4, 'paystack', $5, $6, $7, $8, false, 'rejected', 'Invalid HMAC-SHA512 signature', $9, NOW())`,
+          [
+            eventId,
+            candidatePayment.project_id,
+            candidatePayment.provider_connection_id,
+            candidatePayment.id,
+            eventType,
+            providerEventId,
+            providerTransactionId,
+            payloadHash,
+            parsedPayload,
+          ]
         );
       } catch (err: any) {
         console.warn('Failed to log rejected webhook event:', err.message);
@@ -148,22 +159,23 @@ export class WebhookIngestionService {
       };
     }
 
-    // Step 4: Idempotency Check & Ingestion for authenticated webhook
+    // Step 5: Idempotency Check & Ingestion for authenticated webhook
     try {
       await query(
         `INSERT INTO webhook_events (
-          id, provider, event_type, provider_event_id, provider_transaction_id,
+          id, project_id, provider_connection_id, payment_id, provider, event_type, provider_event_id, provider_transaction_id,
           payload_hash, signature_verified, processing_status, payload, received_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'received', $8, NOW())
+        ) VALUES ($1, $2, $3, $4, 'paystack', $5, $6, $7, $8, true, 'received', $9, NOW())
         ON CONFLICT (provider, provider_transaction_id, event_type) DO NOTHING`,
         [
           eventId,
-          'paystack',
+          candidatePayment.project_id,
+          candidatePayment.provider_connection_id,
+          candidatePayment.id,
           eventType,
           providerEventId,
           providerTransactionId,
           payloadHash,
-          true,
           parsedPayload,
         ]
       );
@@ -187,90 +199,67 @@ export class WebhookIngestionService {
       };
     }
 
-    // 3. Process Domain Events according to State Machine
+    // Step 6: Process Domain Events according to State Machine
     let paymentUpdated = false;
     let processingStatus: 'processed' | 'ignored' | 'failed' = 'ignored';
     let errorMessage: string | null = null;
 
     try {
-      if (eventType === 'charge.success' && data.reference) {
-        const reference = data.reference;
+      if (eventType === 'charge.success') {
         const amountMinor = Number(data.amount);
         const currency = String(data.currency || 'NGN').toUpperCase();
+        const currentStatus = candidatePayment.status as PaymentStatus;
 
-        const payRes = await query(
-          `SELECT * FROM payments WHERE provider_reference = $1`,
-          [reference]
-        );
+        // Zero-Trust verification: amount, currency, and valid state transition
+        const amountMatches = Number(candidatePayment.amount_minor) === amountMinor;
+        const currencyMatches = candidatePayment.currency.toUpperCase() === currency;
 
-        if (payRes.rows.length > 0) {
-          const payment = payRes.rows[0];
-          const currentStatus = payment.status as PaymentStatus;
-
-          // Zero-Trust verification: amount, currency, and valid state transition
-          const amountMatches = Number(payment.amount_minor) === amountMinor;
-          const currencyMatches = payment.currency.toUpperCase() === currency;
-
-          if (!amountMatches) {
-            throw new Error(
-              `Amount mismatch: expected ${payment.amount_minor} minor units, received ${amountMinor}`
-            );
-          }
-          if (!currencyMatches) {
-            throw new Error(
-              `Currency mismatch: expected ${payment.currency}, received ${currency}`
-            );
-          }
-
-          if (currentStatus === 'succeeded') {
-            // Already succeeded: idempotent no-op
-            processingStatus = 'processed';
-          } else {
-            // Check state machine
-            assertValidTransition(
-              currentStatus,
-              'succeeded',
-              `Webhook charge.success for payment ${payment.id}`
-            );
-
-            await query(
-              `UPDATE payments
-               SET status = 'succeeded', updated_at = NOW()
-               WHERE id = $1`,
-              [payment.id]
-            );
-            paymentUpdated = true;
-            processingStatus = 'processed';
-          }
-        } else {
-          // No matching payment record found
-          processingStatus = 'ignored';
-          errorMessage = `No matching payment record found for reference ${reference}`;
+        if (!amountMatches) {
+          throw new Error(
+            `Amount mismatch: expected ${candidatePayment.amount_minor} minor units, received ${amountMinor}`
+          );
         }
-      } else if (eventType === 'charge.failed' && data.reference) {
-        const reference = data.reference;
-        const payRes = await query(
-          `SELECT * FROM payments WHERE provider_reference = $1`,
-          [reference]
-        );
+        if (!currencyMatches) {
+          throw new Error(
+            `Currency mismatch: expected ${candidatePayment.currency}, received ${currency}`
+          );
+        }
 
-        if (payRes.rows.length > 0) {
-          const payment = payRes.rows[0];
-          const currentStatus = payment.status as PaymentStatus;
+        if (currentStatus === 'succeeded') {
+          // Already succeeded: idempotent no-op
+          processingStatus = 'processed';
+        } else {
+          // Check state machine
+          assertValidTransition(
+            currentStatus,
+            'succeeded',
+            `Webhook charge.success for payment ${candidatePayment.id}`
+          );
 
-          if (canTransition(currentStatus, 'failed')) {
-            await query(
-              `UPDATE payments
-               SET status = 'failed', updated_at = NOW()
-               WHERE id = $1`,
-              [payment.id]
-            );
-            paymentUpdated = true;
-            processingStatus = 'processed';
-          } else {
-            processingStatus = 'ignored';
-            errorMessage = `Payment in state '${currentStatus}' cannot transition to 'failed'`;
-          }
+          await query(
+            `UPDATE payments
+             SET status = 'succeeded', updated_at = NOW()
+             WHERE id = $1 AND project_id = $2`,
+            [candidatePayment.id, candidatePayment.project_id]
+          );
+          paymentUpdated = true;
+          processingStatus = 'processed';
+        }
+      } else if (eventType === 'charge.failed') {
+        const currentStatus = candidatePayment.status as PaymentStatus;
+
+        if (canTransition(currentStatus, 'failed')) {
+          await query(
+            `UPDATE payments
+             SET status = 'failed', updated_at = NOW()
+             WHERE id = $1 AND project_id = $2`,
+            [candidatePayment.id, candidatePayment.project_id]
+          );
+          paymentUpdated = true;
+          processingStatus = 'processed';
+        } else {
+          processingStatus = 'ignored';
+          errorMessage = `Payment in state '${currentStatus}' cannot transition to 'failed'`;
         }
       } else {
         // Event received and stored, but no state change required
@@ -282,7 +271,7 @@ export class WebhookIngestionService {
       console.error('Error processing webhook event:', err);
     }
 
-    // 4. Update webhook event status for durable reprocessing & auditability
+    // Step 7: Update webhook event status for durable reprocessing & auditability
     await query(
       `UPDATE webhook_events
        SET processing_status = $1, processed_at = NOW(), error_message = $2

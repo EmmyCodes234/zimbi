@@ -1,36 +1,34 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import type { UserSession } from '../types/index.js';
+import {
+  getAccountSession,
+  saveAccountSession,
+  clearAccountSession,
+  getProjectApiKey,
+  saveProjectApiKey,
+  type SecureSession,
+} from './secure-store.js';
 import { readEnvApiKey } from './config.js';
-
-const GLOBAL_ZIMBI_DIR = path.join(os.homedir(), '.zimbi');
-const CREDENTIALS_FILE = path.join(GLOBAL_ZIMBI_DIR, 'credentials.json');
+import type { UserSession } from '../types/index.js';
 
 export function getGlobalSession(): UserSession | null {
-  // Check process env or local .env first
-  const envKey = process.env.ZIMBI_API_KEY || readEnvApiKey();
-
-  if (fs.existsSync(CREDENTIALS_FILE)) {
-    try {
-      const raw = fs.readFileSync(CREDENTIALS_FILE, 'utf8');
-      const session = JSON.parse(raw) as UserSession;
-      if (session && session.token) {
-        return session;
-      }
-    } catch {
-      // Fallback
-    }
+  // Check OS Secure Store first
+  const secure = getAccountSession();
+  if (secure && secure.sessionToken) {
+    return {
+      email: secure.email,
+      userId: secure.accountId,
+      token: secure.sessionToken,
+      projects: [],
+    };
   }
 
+  // Fallback to environment variable or local .env
+  const envKey = process.env.ZIMBI_API_KEY || readEnvApiKey();
   if (envKey) {
     return {
       email: 'api-key-user@zimbi.dev',
       userId: 'usr_apikey',
       token: envKey,
-      projects: [
-        { id: 'proj_default', name: 'default', createdAt: new Date().toISOString() },
-      ],
+      projects: [{ id: 'proj_default', name: 'default', createdAt: new Date().toISOString() }],
     };
   }
 
@@ -38,18 +36,27 @@ export function getGlobalSession(): UserSession | null {
 }
 
 export function saveGlobalSession(session: UserSession): void {
-  if (!fs.existsSync(GLOBAL_ZIMBI_DIR)) {
-    fs.mkdirSync(GLOBAL_ZIMBI_DIR, { recursive: true });
-  }
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(session, null, 2), 'utf8');
+  saveAccountSession({
+    accountId: session.userId || 'acc_default',
+    email: session.email,
+    sessionToken: session.token,
+    createdAt: new Date().toISOString(),
+  });
 }
 
 export function clearGlobalSession(): void {
-  if (fs.existsSync(CREDENTIALS_FILE)) {
-    fs.unlinkSync(CREDENTIALS_FILE);
-  }
+  clearAccountSession();
 }
 
 export function isAuthenticated(): boolean {
-  return getGlobalSession() !== null;
+  return getAccountSession() !== null || Boolean(process.env.ZIMBI_API_KEY || readEnvApiKey());
 }
+
+export {
+  getAccountSession,
+  saveAccountSession,
+  clearAccountSession,
+  getProjectApiKey,
+  saveProjectApiKey,
+  type SecureSession,
+};

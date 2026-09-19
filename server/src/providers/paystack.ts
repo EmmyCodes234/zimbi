@@ -179,7 +179,7 @@ export class PaystackProvider implements PaymentProvider {
       throw new Error('Paystack secret key is required to initialize transaction.');
     }
 
-    if (this.secretKey === 'sk_test_mock_secret_key_12345' || this.secretKey === 'sk_test_demo_key_placeholder') {
+    if (this.secretKey.startsWith('sk_test_mock_') || this.secretKey === 'sk_test_demo_key_placeholder') {
       return {
         providerReference: params.reference,
         authorizationUrl: `https://checkout.paystack.com/${params.reference.toLowerCase()}`,
@@ -200,12 +200,12 @@ export class PaystackProvider implements PaymentProvider {
     const data = (await res.json()) as any;
 
     if (!res.ok || !data.status) {
-      const errorMsg = data.message || `Paystack API responded with HTTP ${res.status}`;
-      throw new Error(`Paystack initialization failed: ${errorMsg}`);
+      const msg = data?.message || `Paystack initialization failed with status ${res.status}`;
+      throw new Error(redactSecrets(msg));
     }
 
     return {
-      providerReference: data.data.reference || params.reference,
+      providerReference: data.data.reference,
       authorizationUrl: data.data.authorization_url,
       accessCode: data.data.access_code,
       status: 'pending',
@@ -225,7 +225,7 @@ export class PaystackProvider implements PaymentProvider {
     }
 
     // Support deterministic testing when using mock secret key
-    if (this.secretKey === 'sk_test_mock_secret_key_12345' || this.secretKey === 'sk_test_demo_key_placeholder') {
+    if (this.secretKey.startsWith('sk_test_mock_') || this.secretKey === 'sk_test_demo_key_placeholder') {
       if (reference.includes('mock_fail')) {
         return {
           status: 'failed',

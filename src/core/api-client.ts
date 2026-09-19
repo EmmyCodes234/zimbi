@@ -3,7 +3,7 @@ import path from 'node:path';
 import { generateRequestId, ZimbiError } from './errors.js';
 import { ExitCodes } from './exit-codes.js';
 import { readProjectConfig, updateProjectConfig, readEnvApiKey, ZIMBI_DIR } from './config.js';
-import { getGlobalSession } from './auth.js';
+import { getGlobalSession, getAccountSession, getProjectApiKey, saveProjectApiKey } from './auth.js';
 import type {
   DoctorReport,
   EnvironmentMode,
@@ -14,6 +14,7 @@ import type {
 
 export interface ApiClientOptions {
   apiKey?: string;
+  sessionToken?: string;
   baseUrl?: string;
   verbose?: boolean;
   cwd?: string;
@@ -32,19 +33,36 @@ interface LocalState {
 
 export class ZimbiApiClient {
   private apiKey?: string;
+  private sessionToken?: string;
   private baseUrl: string;
   private verbose: boolean;
   private cwd: string;
 
   constructor(options: ApiClientOptions = {}) {
+    const cwd = options.cwd || process.cwd();
+    const globalSession = getGlobalSession();
+    const accountSession = getAccountSession();
+
+    this.sessionToken =
+      options.sessionToken ||
+      accountSession?.sessionToken ||
+      (globalSession?.token?.startsWith('zmb_sess_') ? globalSession.token : undefined);
+
+    const activeProject = readProjectConfig(cwd)?.project;
+    const cachedKey = activeProject ? getProjectApiKey(activeProject) : null;
+
     this.apiKey =
       options.apiKey ||
       process.env.ZIMBI_API_KEY ||
-      readEnvApiKey(options.cwd || process.cwd()) ||
-      getGlobalSession()?.token;
+      readEnvApiKey(cwd) ||
+      cachedKey ||
+      (globalSession?.token?.startsWith('zmb_test_') || globalSession?.token?.startsWith('zmb_live_')
+        ? globalSession.token
+        : undefined);
+
     this.baseUrl = options.baseUrl || process.env.ZIMBI_API_URL || 'http://127.0.0.1:4000';
     this.verbose = options.verbose || false;
-    this.cwd = options.cwd || process.cwd();
+    this.cwd = cwd;
   }
 
   private async fetchApi<T>(
@@ -61,8 +79,19 @@ export class ZimbiApiClient {
         'x-request-id': reqId,
       };
 
-      if (this.apiKey) {
-        headers['Authorization'] = `Bearer ${this.apiKey}`;
+      // Determine appropriate credential (account session vs project API key)
+      let authToken = this.apiKey;
+      const isAccountEndpoint =
+        endpoint.startsWith('/v1/projects') ||
+        endpoint.startsWith('/v1/auth/me') ||
+        endpoint.startsWith('/v1/auth/logout');
+
+      if (isAccountEndpoint) {
+        authToken = this.sessionToken || this.apiKey;
+      }
+
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`;
       }
 
       const res = await fetch(url, {
@@ -221,7 +250,80 @@ export class ZimbiApiClient {
     fs.writeFileSync(this.getStateFilePath(), JSON.stringify(state, null, 2), 'utf8');
   }
 
-  // --- Projects ---
+  // --- Authentication & Device Flow (RFC 8628) ---
+  async requestDeviceCode(metadata: any = {}): Promise<{
+    deviceCode: string;
+    userCode: string;
+    verificationUri: string;
+    expiresIn: number;
+    interval: number;
+  }> {
+    const res = await this.fetchApi<any>('/v1/auth/device/code', {
+      method: 'POST',
+      body: JSON.stringify(metadata),
+    });
+
+    if (res && res.deviceCode) {
+      return res;
+    }
+
+    throw new ZimbiError({
+      message: 'Failed to request device authorization from ZIMBI API.',
+      exitCode: ExitCodes.NETWORK_FAILURE,
+      requestId: generateRequestId(),
+    });
+  }
+
+  async pollDeviceToken(deviceCode: string): Promise<{
+    status: 'pending' | 'approved' | 'expired' | 'denied';
+    sessionToken?: string;
+    account?: { id: string; email: string; name?: string };
+    error?: string;
+  }> {
+    const res = await this.fetchApi<any>('/v1/auth/device/token', {
+      method: 'POST',
+      body: JSON.stringify({ deviceCode }),
+    });
+
+    return res || { status: 'pending' };
+  }
+
+  async logout(): Promise<void> {
+    await this.fetchApi('/v1/auth/logout', {
+      method: 'POST',
+    });
+  }
+
+  async whoami(): Promise<any> {
+    return this.fetchApi('/v1/auth/whoami');
+  }
+
+  // --- Projects (Account-Scoped) ---
+  async listProjects(): Promise<
+    Array<{
+      id: string;
+      name: string;
+      environment: EnvironmentMode;
+      status: string;
+      slug?: string;
+    }>
+  > {
+    const apiRes = await this.fetchApi<{ projects: any[] }>('/v1/projects');
+    if (apiRes && apiRes.projects) {
+      return apiRes.projects;
+    }
+
+    const proj = readProjectConfig(this.cwd);
+    return [
+      {
+        id: proj?.project || 'proj_default',
+        name: proj?.project || 'default',
+        environment: proj?.environment || 'test',
+        status: 'active',
+      },
+    ];
+  }
+
   async createProject(name: string, env: EnvironmentMode = 'test'): Promise<{
     id: string;
     name: string;
@@ -236,6 +338,7 @@ export class ZimbiApiClient {
 
     if (apiRes && apiRes.id) {
       this.apiKey = apiRes.apiKey;
+      saveProjectApiKey(apiRes.id, apiRes.apiKey, env);
       return apiRes;
     }
 
@@ -243,6 +346,7 @@ export class ZimbiApiClient {
     const id = `proj_${name.toLowerCase()}`;
     const apiKey = `zmb_${env}_${Math.random().toString(36).substring(2, 14)}`;
     this.apiKey = apiKey;
+    saveProjectApiKey(id, apiKey, env);
     return {
       id,
       name,
@@ -250,6 +354,17 @@ export class ZimbiApiClient {
       apiKey,
       keyId: 'key_local_' + Math.random().toString(36).substring(2, 8),
     };
+  }
+
+  async generateProjectKey(projectId: string): Promise<string> {
+    const res = await this.fetchApi<any>(`/v1/projects/${projectId}/keys`, {
+      method: 'POST',
+    });
+    if (res && res.apiKey) {
+      saveProjectApiKey(projectId, res.apiKey, res.environment);
+      return res.apiKey;
+    }
+    return '';
   }
 
   // --- Markets ---

@@ -269,7 +269,16 @@ export async function runInitCommand(options: InitCommandOptions): Promise<void>
 
   // Connect provider and market in state
   const projRes = await client.createProject(chosenProject, chosenEnv);
-  writeEnvApiKey(projRes.apiKey, cwd);
+
+  console.log();
+  printSuccess('Project selected');
+  console.log();
+
+  const configureEnv = await askConfirm('Configure this project for local development (.env)?', true, options);
+  if (configureEnv) {
+    writeEnvApiKey(projRes.apiKey, cwd);
+    printSuccess('Configured ZIMBI_API_KEY in .env');
+  }
 
   await client.validateAndConnectProvider(providerChoice, secretKey, chosenEnv);
   await client.enableMarket('NG');

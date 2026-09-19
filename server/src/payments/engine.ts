@@ -113,7 +113,9 @@ export class PaymentEngine {
 
     // 4. Instantiate provider with merchant-owned secret key
     const provider = new PaystackProvider({ environment, secretKey });
-    const reference = `${paymentId}_ref`;
+
+    // Hard Invariant: ONE ZIMBI PAYMENT -> ONE IMMUTABLE ZIMBI PROVIDER REFERENCE
+    const reference = `zmb_ref_${paymentId}`;
 
     // 5. Initialize transaction with Paystack API
     const trxResult = await provider.initializeTransaction({
@@ -130,7 +132,7 @@ export class PaymentEngine {
       },
     });
 
-    // 6. Insert payment row into PostgreSQL with provider_connection_id
+    // 6. Insert payment row into PostgreSQL with provider_connection_id and immutable reference
     await query(
       `INSERT INTO payments (
         id, project_id, market_code, amount_minor, currency, payment_method,
@@ -146,7 +148,7 @@ export class PaymentEngine {
         'pending',
         'paystack',
         connection.id,
-        trxResult.providerReference,
+        trxResult.providerReference || reference,
         trxResult.authorizationUrl,
         requestId,
       ]
@@ -173,7 +175,7 @@ export class PaymentEngine {
       paymentMethod: input.paymentMethod,
       status: 'pending',
       provider: 'Paystack',
-      providerReference: trxResult.providerReference,
+      providerReference: trxResult.providerReference || reference,
       providerConnectionId: connection.id,
       authorizationUrl: trxResult.authorizationUrl,
       requestId,
@@ -182,15 +184,12 @@ export class PaymentEngine {
     };
   }
 
-  async getPayment(paymentId: string, projectId?: string): Promise<PaymentDetails | null> {
-    const params: any[] = [paymentId];
-    let sql = `SELECT * FROM payments WHERE id = $1`;
-    if (projectId) {
-      sql += ` AND project_id = $2`;
-      params.push(projectId);
-    }
+  async getPayment(paymentId: string, projectId: string): Promise<PaymentDetails | null> {
+    const res = await query(
+      `SELECT * FROM payments WHERE id = $1 AND project_id = $2`,
+      [paymentId, projectId]
+    );
 
-    const res = await query(sql, params);
     if (res.rows.length === 0) {
       return null;
     }
@@ -202,15 +201,15 @@ export class PaymentEngine {
         ? `₦${amountMajor.toLocaleString()}`
         : `${row.currency} ${amountMajor.toLocaleString()}`;
 
-    // Get correlated webhook events if any
+    // Get correlated webhook events strictly scoped by project
     let webhookEvents: PaymentDetails['webhookEvents'] = [];
     if (row.provider_reference) {
       const whRes = await query(
         `SELECT event_type, received_at, signature_verified, processing_status
          FROM webhook_events
-         WHERE provider_transaction_id = $1
+         WHERE project_id = $1 AND (payment_id = $2 OR provider_transaction_id = $3)
          ORDER BY received_at ASC`,
-        [row.provider_reference]
+        [projectId, row.id, row.provider_reference]
       );
       webhookEvents = whRes.rows.map((r: any) => ({
         eventType: r.event_type,
@@ -242,17 +241,19 @@ export class PaymentEngine {
 
   /**
    * Reconciles local payment state with the payment provider.
-   * Detects and safely resolves discrepancies using the state machine.
+   * STRICT ORDERING:
+   * 1. Authenticate project
+   * 2. Authorize ownership (WHERE id = $1 AND project_id = $2)
+   * 3. Decrypt credential in memory only after ownership confirmed
+   * 4. Call provider API
    */
-  async reconcilePayment(paymentId: string, projectId?: string): Promise<ReconciliationResult> {
-    const params: any[] = [paymentId];
-    let sql = `SELECT * FROM payments WHERE id = $1`;
-    if (projectId) {
-      sql += ` AND project_id = $2`;
-      params.push(projectId);
-    }
+  async reconcilePayment(paymentId: string, projectId: string): Promise<ReconciliationResult> {
+    // 1. Ownership check: Must belong strictly to the authenticated project
+    const res = await query(
+      `SELECT * FROM payments WHERE id = $1 AND project_id = $2`,
+      [paymentId, projectId]
+    );
 
-    const res = await query(sql, params);
     if (res.rows.length === 0) {
       throw new Error(`Payment '${paymentId}' not found`);
     }
@@ -276,13 +277,13 @@ export class PaymentEngine {
       };
     }
 
-    // Resolve merchant secret key for verification
+    // 2. Resolve merchant secret key for verification from owning connection
     let secretKey = '';
     if (row.provider_connection_id) {
       const connRes = await query(
         `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
-         FROM provider_connections WHERE id = $1`,
-        [row.provider_connection_id]
+         FROM provider_connections WHERE id = $1 AND project_id = $2`,
+        [row.provider_connection_id, projectId]
       );
       if (connRes.rows.length > 0) {
         const conn = connRes.rows[0];
@@ -297,7 +298,7 @@ export class PaymentEngine {
       const connRes = await query(
         `SELECT credential_ciphertext, credential_iv, credential_auth_tag, credential_key_version
          FROM provider_connections WHERE project_id = $1 AND provider = 'paystack' AND status = 'connected'`,
-        [row.project_id]
+        [projectId]
       );
       if (connRes.rows.length > 0) {
         const conn = connRes.rows[0];
@@ -310,7 +311,11 @@ export class PaymentEngine {
       }
     }
 
-    // Provider check with decrypted merchant key
+    if (!secretKey) {
+      throw new Error(`No active provider connection found for payment '${paymentId}' to reconcile.`);
+    }
+
+    // 3. Provider check with decrypted merchant key
     const env = row.id.startsWith('pay_live_') ? 'production' : 'test';
     const provider = new PaystackProvider({ environment: env, secretKey });
     const verification = await provider.verifyTransaction(reference);
@@ -346,8 +351,8 @@ export class PaymentEngine {
              SET status = 'succeeded',
                  metadata = metadata || jsonb_build_object('reconciled_at', NOW(), 'reconciled_status', 'succeeded'),
                  updated_at = NOW()
-             WHERE id = $1`,
-            [paymentId]
+             WHERE id = $1 AND project_id = $2`,
+            [paymentId, projectId]
           );
           actionTaken = 'updated_to_succeeded';
           inSync = true;
@@ -364,8 +369,8 @@ export class PaymentEngine {
              SET status = 'failed',
                  metadata = metadata || jsonb_build_object('reconciled_at', NOW(), 'reconciled_status', 'failed'),
                  updated_at = NOW()
-             WHERE id = $1`,
-            [paymentId]
+             WHERE id = $1 AND project_id = $2`,
+            [paymentId, projectId]
           );
           actionTaken = 'updated_to_failed';
           inSync = true;
@@ -380,8 +385,8 @@ export class PaymentEngine {
              SET status = 'expired',
                  metadata = metadata || jsonb_build_object('reconciled_at', NOW(), 'reconciled_status', 'expired'),
                  updated_at = NOW()
-             WHERE id = $1`,
-            [paymentId]
+             WHERE id = $1 AND project_id = $2`,
+            [paymentId, projectId]
           );
           actionTaken = 'updated_to_expired';
           inSync = true;
